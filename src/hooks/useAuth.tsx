@@ -26,6 +26,12 @@ export function useAuth() {
   return useContext(AuthContext);
 }
 
+// Helper: detect mobile
+function isMobileDevice() {
+  if (typeof window === "undefined") return false;
+  return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+}
+
 // Declare Google Identity Services types
 declare global {
   interface Window {
@@ -56,7 +62,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   // Load Google Identity Services script
   useEffect(() => {
-    // Check if already loaded
     if (window.google?.accounts) {
       setGsiLoaded(true);
       return;
@@ -69,10 +74,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     script.onload = () => setGsiLoaded(true);
     script.onerror = () => setError("Impossible de charger Google Sign-In");
     document.head.appendChild(script);
-
-    return () => {
-      // Don't remove script on cleanup to avoid re-loading
-    };
   }, []);
 
   // Initialize once GSI is loaded
@@ -92,16 +93,64 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setIsLoading(false);
   }, [gsiLoaded]);
 
+  // Handle OAuth callback (for mobile redirect flow)
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const params = new URLSearchParams(window.location.hash.substring(1));
+    const accessToken = params.get("access_token");
+    
+    if (accessToken) {
+      // Get user info from Google
+      fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      })
+        .then(res => res.json())
+        .then(data => {
+          const userInfo: UserInfo = {
+            name: data.name || data.email,
+            email: data.email,
+            picture: data.picture,
+            accessToken: accessToken,
+          };
+          setUser(userInfo);
+          sessionStorage.setItem("klix-user", JSON.stringify(userInfo));
+          // Clean URL
+          window.history.replaceState({}, document.title, window.location.pathname);
+        })
+        .catch(err => {
+          console.error("Failed to get user info:", err);
+          setError("Échec de la connexion");
+        });
+    }
+  }, []);
+
   const signIn = useCallback(() => {
-    if (!window.google) {
+    if (!window.google && !isMobileDevice()) {
       setError("Google Sign-In non disponible");
       return;
     }
 
     setError(null);
 
-    // Step 1: Get identity via ID token
-    window.google.accounts.id.initialize({
+    // MOBILE: Use redirect flow
+    if (isMobileDevice()) {
+      const redirectUri = window.location.origin + window.location.pathname;
+      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` + new URLSearchParams({
+        client_id: GOOGLE_WEB_CLIENT_ID,
+        redirect_uri: redirectUri,
+        response_type: "token",
+        scope: GOOGLE_SCOPES + " https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email",
+        include_granted_scopes: "true",
+        state: "pass-through-value"
+      }).toString();
+
+      window.location.href = authUrl;
+      return;
+    }
+
+    // DESKTOP: Use GSI popup flow
+    window.google!.accounts.id.initialize({
       client_id: GOOGLE_WEB_CLIENT_ID,
       callback: (response: { credential?: string }) => {
         if (!response.credential) {
@@ -109,24 +158,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           return;
         }
 
-        // Decode JWT to get user info
-        const payload = JSON.parse(
-          atob(response.credential.split(".")[1])
-        );
+        const payload = JSON.parse(atob(response.credential.split(".")[1]));
         const userInfo: Partial<UserInfo> = {
           name: payload.name || payload.email,
           email: payload.email,
           picture: payload.picture,
         };
 
-        // Step 2: Get access token for Sheets
         const tokenClient = window.google!.accounts.oauth2.initTokenClient({
           client_id: GOOGLE_WEB_CLIENT_ID,
           scope: GOOGLE_SCOPES,
-          callback: (tokenResponse: {
-            access_token?: string;
-            error?: string;
-          }) => {
+          callback: (tokenResponse: { access_token?: string; error?: string }) => {
             if (tokenResponse.error || !tokenResponse.access_token) {
               setError("Impossible d'obtenir l'accès à Google Sheets");
               return;
@@ -150,7 +192,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       auto_select: false,
     });
 
-    window.google.accounts.id.prompt();
+    window.google!.accounts.id.prompt();
   }, []);
 
   const signOut = useCallback(() => {
@@ -171,10 +213,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const tokenClient = window.google.accounts.oauth2.initTokenClient({
         client_id: GOOGLE_WEB_CLIENT_ID,
         scope: GOOGLE_SCOPES,
-        callback: (tokenResponse: {
-          access_token?: string;
-          error?: string;
-        }) => {
+        callback: (tokenResponse: { access_token?: string; error?: string }) => {
           if (tokenResponse.error || !tokenResponse.access_token) {
             resolve(null);
             return;
